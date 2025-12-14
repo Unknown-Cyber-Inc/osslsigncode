@@ -904,6 +904,41 @@ static void check_authenticode_timestamp(BIO **resp)
 }
 
 /*
+ * Read all remaining bytes from a BIO into a memory BIO.
+ * Returns a memory BIO positioned at the start, or NULL on error.
+ *
+ * This is used for HTTP GET responses to ensure the full response
+ * body is available to decoders that expect a seekable BIO.
+ */
+static BIO *bio_slurp_to_mem(BIO *in)
+{
+    BIO *mem = BIO_new(BIO_s_mem());
+    char buf[8192];
+    int n;
+
+    if (!mem)
+        return NULL;
+
+    ERR_clear_error();
+    while ((n = BIO_read(in, buf, sizeof(buf))) > 0) {
+        if (BIO_write(mem, buf, n) != n) {
+            BIO_free(mem);
+            return NULL;
+        }
+    }
+
+    /* n == 0: clean EOF. n < 0: treat as error unless retry is indicated. */
+    if (n < 0 && !BIO_should_retry(in)) {
+        BIO_free(mem);
+        return NULL;
+    }
+
+    (void)BIO_seek(mem, 0);
+    return mem;
+}
+
+
+/*
  * Get data from HTTP server.
  * [in] url: URL of the CRL distribution point or Time-Stamp Authority HTTP server
  * [in] req: timestamp request
@@ -996,10 +1031,21 @@ static BIO *bio_get_http(char *url, BIO *req, char *proxy, int rfc3161, char *ca
     SSL_CTX_free(ssl_ctx);
 
     if (s_bio) {
-        resp = socket_bio_read(s_bio, rctx, use_ssl);
-        BIO_free_all(s_bio);
-        if (resp && req && !rfc3161)
-            check_authenticode_timestamp(&resp);
+        if (!req) {
+            /*
+             * GET (CRLs): ensure we have the complete body in a seekable BIO.
+             * Some decoders may need to re-read the data, and partial reads
+             * can produce truncated DER that fails to parse.
+             */
+            resp = bio_slurp_to_mem(s_bio);
+            BIO_free_all(s_bio);
+        } else {
+            /* POST: read response using the request context. */
+            resp = socket_bio_read(s_bio, rctx, use_ssl);
+            BIO_free_all(s_bio);
+            if (resp && !rfc3161)
+                check_authenticode_timestamp(&resp);
+        }
     } else {
         fprintf(stderr, "\nHTTP failure: Failed to get data from %s\n", url);
     }
