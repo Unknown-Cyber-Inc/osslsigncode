@@ -1840,6 +1840,22 @@ static char *x509_name_to_utf8(const X509_NAME *name)
     return str;
 }
 
+static void print_name_cn(const char *label, X509_NAME *name)
+{
+    char cn[256];
+
+    if (!name) {
+        printf("\t\t%s: N/A\n", label);
+        return;
+    }
+
+    if (X509_NAME_get_text_by_NID(name, NID_commonName, cn, sizeof(cn)) > 0) {
+        printf("\t\t%s: %s\n", label, cn);
+    } else {
+        printf("\t\t%s: N/A\n", label);
+    }
+}
+
 /*
  * Print fingerprint (digest) of a certificate.
  * Uses X509_digest(), which digests the DER-encoded certificate.
@@ -1972,8 +1988,12 @@ static void print_cert(X509 *cert, int i)
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
     serial = BN_bn2hex(serialbn);
     printf("\t------------------\n");
-    printf("\tSigner #%d:\n\t\tSubject: %s\n\t\tIssuer : %s\n\t\tSerial : %s\n",
-            i, subject, issuer, serial);
+    printf("\tSigner #%d:\n", i);
+    print_name_cn("Subject", X509_get_subject_name(cert));
+    printf("\t\t\tSubject Full: %s\n", subject);
+    print_name_cn("Issuer", X509_get_issuer_name(cert));
+    printf("\t\t\tIssuer Full: %s\n", issuer);
+    printf("\t\tSerial : %s\n", serial);
     print_cert_sig_alg(cert);
     print_cert_fingerprint(cert, EVP_md5(), "MD5 Fingerprint");
     print_cert_fingerprint(cert, EVP_sha1(), "SHA1 Fingerprint");
