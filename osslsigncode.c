@@ -1841,6 +1841,120 @@ static char *x509_name_to_utf8(const X509_NAME *name)
 }
 
 /*
+ * Print fingerprint (digest) of a certificate.
+ * Uses X509_digest(), which digests the DER-encoded certificate.
+ */
+static void print_cert_fingerprint(X509 *cert, const EVP_MD *md, const char *label)
+{
+    unsigned int n = 0;
+    unsigned char buf[EVP_MAX_MD_SIZE];
+    unsigned int i;
+
+    if (!cert || !md || !label) {
+        printf("\t\t%s: N/A\n", label ? label : "Fingerprint");
+        return;
+    }
+
+    if (!X509_digest(cert, md, buf, &n) || n == 0) {
+        printf("\t\t%s: N/A\n", label);
+        return;
+    }
+
+    printf("\t\t%s: ", label);
+    for (i = 0; i < n; i++) {
+        printf("%02X", buf[i]);
+    }
+    printf("\n");
+}
+
+/*
+ * Print the certificate signature algorithm (X509_ALGOR).
+ */
+static void print_cert_sig_alg(X509 *cert)
+{
+    const X509_ALGOR *alg = NULL;
+    const ASN1_OBJECT *obj = NULL;
+    char oid[128];
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    alg = X509_get0_tbs_sigalg(cert);
+#endif
+    if (!alg) {
+        printf("\t\tSignature Algorithm: N/A\n");
+        return;
+    }
+
+    X509_ALGOR_get0(&obj, NULL, NULL, alg);
+    if (!obj) {
+        printf("\t\tSignature Algorithm: N/A\n");
+        return;
+    }
+
+    oid[0] = '\0';
+    OBJ_obj2txt(oid, (int)sizeof(oid), obj, 1);
+
+    if (OBJ_obj2nid(obj) != NID_undef) {
+        printf("\t\tSignature Algorithm: %s\n",
+               OBJ_nid2ln(OBJ_obj2nid(obj)));
+    } else {
+        printf("\t\tSignature Algorithm: %s\n", oid);
+    }
+}
+
+/*
+ * Print KeyUsage and ExtendedKeyUsage extensions (when present).
+ */
+static void print_cert_key_usages(X509 *cert)
+{
+    EXTENDED_KEY_USAGE *eku = NULL;
+    int xku = 0;
+    int i, any = 0;
+
+    if (!cert) {
+        printf("\t\tValid Usage: N/A\n");
+        return;
+    }
+
+    xku = X509_get_extended_key_usage(cert);
+
+    if (xku & XKU_ANYEKU) {
+        printf("\t\tValid Usage: All\n");
+        return;
+    }
+
+    eku = (EXTENDED_KEY_USAGE *)X509_get_ext_d2i(cert, NID_ext_key_usage, NULL, NULL);
+    if (!eku) {
+        printf("\t\tValid Usage: N/A\n");
+        return;
+    }
+
+    int n = sk_ASN1_OBJECT_num(eku);
+    printf("\t\tValid Usage: ");
+
+    if (n <= 0) {
+        printf("None\n");
+    } else {
+        for (i = 0; i < n; i++) {
+            ASN1_OBJECT *o = sk_ASN1_OBJECT_value(eku, i);
+            int nid = o ? OBJ_obj2nid(o) : NID_undef;
+
+            if (i)
+                printf(", ");
+
+            if (nid != NID_undef)
+                printf("%s", OBJ_nid2ln(nid));
+            else
+                printf("Unknown");
+        }
+        printf("\n");
+    }
+
+    EXTENDED_KEY_USAGE_free(eku);
+}
+
+
+
+/*
  * Print certificate subject name, issuer name, serial number and expiration date
  * [in] cert: X509 certificate
  * [in] i: certificate number in order
@@ -1858,13 +1972,20 @@ static void print_cert(X509 *cert, int i)
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
     serial = BN_bn2hex(serialbn);
     printf("\t------------------\n");
-    printf("\tSigner #%d:\n\t\tSubject: %s\n\t\tIssuer : %s\n\t\tSerial : %s\n\t\tCertificate expiration date:\n",
+    printf("\tSigner #%d:\n\t\tSubject: %s\n\t\tIssuer : %s\n\t\tSerial : %s\n",
             i, subject, issuer, serial);
+    print_cert_sig_alg(cert);
+    print_cert_fingerprint(cert, EVP_md5(), "MD5 Fingerprint");
+    print_cert_fingerprint(cert, EVP_sha1(), "SHA1 Fingerprint");
+    print_cert_fingerprint(cert, EVP_sha256(), "SHA256 Fingerprint");
+    print_cert_key_usages(cert);
+    printf("\n\t\tCertificate expiration date:\n");
     printf("\t\t\tnotBefore : ");
     print_asn1_time(X509_get0_notBefore(cert));
     printf("\t\t\tnotAfter : ");
     print_asn1_time(X509_get0_notAfter(cert));
     printf("\n");
+
 
     OPENSSL_free(subject);
     OPENSSL_free(issuer);
