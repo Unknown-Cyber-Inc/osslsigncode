@@ -1867,16 +1867,16 @@ static void print_cert_fingerprint(X509 *cert, const EVP_MD *md, const char *lab
     unsigned int i;
 
     if (!cert || !md || !label) {
-        printf("\t\t%s: N/A\n", label ? label : "Fingerprint");
+        printf("\t\t\t%s: N/A\n", label ? label : "Fingerprint");
         return;
     }
 
     if (!X509_digest(cert, md, buf, &n) || n == 0) {
-        printf("\t\t%s: N/A\n", label);
+        printf("\t\t\t%s: N/A\n", label);
         return;
     }
 
-    printf("\t\t%s: ", label);
+    printf("\t\t\t%s: ", label);
     for (i = 0; i < n; i++) {
         printf("%02X", buf[i]);
     }
@@ -1995,9 +1995,10 @@ static void print_cert(X509 *cert, int i)
     printf("\t\t\tIssuer Full: %s\n", issuer);
     printf("\t\tSerial : %s\n", serial);
     print_cert_sig_alg(cert);
-    print_cert_fingerprint(cert, EVP_md5(), "MD5 Fingerprint");
-    print_cert_fingerprint(cert, EVP_sha1(), "SHA1 Fingerprint");
-    print_cert_fingerprint(cert, EVP_sha256(), "SHA256 Fingerprint");
+    printf("\t\tFingerprints:\n");
+    print_cert_fingerprint(cert, EVP_md5(), "MD5");
+    print_cert_fingerprint(cert, EVP_sha1(), "SHA1");
+    print_cert_fingerprint(cert, EVP_sha256(), "SHA256");
     print_cert_key_usages(cert);
     printf("\n\t\tCertificate expiration date:\n");
     printf("\t\t\tnotBefore : ");
