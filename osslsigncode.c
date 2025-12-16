@@ -1762,23 +1762,49 @@ static int x509_store_set_time(X509_STORE *store, time_t time)
 }
 
 /*
+ * Convert ASN1_TIME to a newly-allocated human-readable string.
+ * [in] time: ASN1_TIME
+ * [returns] allocated string; "N/A" on error
+ */
+static char *asn1_time_to_utf8(const ASN1_TIME *time)
+{
+    BIO *bio = NULL;
+    BUF_MEM *bptr = NULL;
+    char *out = NULL;
+
+    if (!time || !ASN1_TIME_check(time))
+        return OPENSSL_strdup("N/A");
+
+    bio = BIO_new(BIO_s_mem());
+    if (!bio)
+        return OPENSSL_strdup("N/A");
+
+    if (!ASN1_TIME_print(bio, time)) {
+        BIO_free(bio);
+        return OPENSSL_strdup("N/A");
+    }
+
+    BIO_get_mem_ptr(bio, &bptr);
+    out = OPENSSL_strndup(bptr->data, bptr->length);
+    BIO_free(bio);
+
+    return out ? out : OPENSSL_strdup("N/A");
+}
+
+/*
  * Check the syntax of the time structure and print the time in human readable format
  * [in] time: time structure
  * [returns] 0 on error or 1 on success
  */
 static int print_asn1_time(const ASN1_TIME *time)
 {
-    BIO *bp;
+    char *s = asn1_time_to_utf8(time);
+    int ok = (s && strcmp(s, "N/A") != 0);
 
-    if ((time == NULL) || (!ASN1_TIME_check(time))) {
-        printf("N/A\n");
-        return 0; /* FAILED */
-    }
-    bp = BIO_new_fp(stdout, BIO_NOCLOSE);
-    ASN1_TIME_print(bp, time);
-    BIO_free(bp);
-    printf("\n");
-    return 1; /* OK */
+    printf("%s\n", s ? s : "N/A");
+    OPENSSL_free(s);
+
+    return ok ? 1 : 0;
 }
 
 /*
@@ -1840,134 +1866,150 @@ static char *x509_name_to_utf8(const X509_NAME *name)
     return str;
 }
 
-static void print_name_cn(const char *label, X509_NAME *name)
+/*
+ * Return the Common Name (CN) from an X509_NAME as a newly-allocated string.
+ * [in] name: X509_NAME to extract CN from
+ * [returns] allocated string; "N/A" if missing/error
+ */
+static char *x509_name_cn_to_utf8(const X509_NAME *name)
 {
     char cn[256];
 
-    if (!name) {
-        printf("\t\t%s: N/A\n", label);
-        return;
-    }
+    if (!name)
+        return OPENSSL_strdup("N/A");
 
-    if (X509_NAME_get_text_by_NID(name, NID_commonName, cn, sizeof(cn)) > 0) {
-        printf("\t\t%s: %s\n", label, cn);
-    } else {
-        printf("\t\t%s: N/A\n", label);
-    }
+    if (X509_NAME_get_text_by_NID((X509_NAME *)name, NID_commonName, cn, (int)sizeof(cn)) > 0)
+        return OPENSSL_strdup(cn);
+
+    return OPENSSL_strdup("N/A");
 }
 
 /*
- * Print fingerprint (digest) of a certificate.
- * Uses X509_digest(), which digests the DER-encoded certificate.
+ * Return hex digest of a certificate as a newly-allocated string (no colons).
+ * Uses X509_digest() over DER-encoded certificate.
+ * [in] cert: certificate
+ * [in] md: digest algorithm (EVP_md5/sha1/sha256/etc)
+ * [returns] allocated hex string; "N/A" on error
  */
-static void print_cert_fingerprint(X509 *cert, const EVP_MD *md, const char *label)
+static char *x509_cert_fingerprint_hex(X509 *cert, const EVP_MD *md)
 {
     unsigned int n = 0;
     unsigned char buf[EVP_MAX_MD_SIZE];
+    char *hex = NULL;
     unsigned int i;
 
-    if (!cert || !md || !label) {
-        printf("\t\t\t%s: N/A\n", label ? label : "Fingerprint");
-        return;
-    }
+    if (!cert || !md)
+        return OPENSSL_strdup("N/A");
 
-    if (!X509_digest(cert, md, buf, &n) || n == 0) {
-        printf("\t\t\t%s: N/A\n", label);
-        return;
-    }
+    if (!X509_digest(cert, md, buf, &n) || n == 0)
+        return OPENSSL_strdup("N/A");
 
-    printf("\t\t\t%s: ", label);
-    for (i = 0; i < n; i++) {
-        printf("%02X", buf[i]);
-    }
-    printf("\n");
+    /* 2 chars per byte + NUL */
+    hex = OPENSSL_malloc((size_t)n * 2 + 1);
+    if (!hex)
+        return OPENSSL_strdup("N/A");
+
+    for (i = 0; i < n; i++)
+        sprintf(hex + (i * 2), "%02X", buf[i]);
+    hex[n * 2] = '\0';
+
+    return hex;
 }
 
 /*
- * Print the certificate signature algorithm (X509_ALGOR).
+ * Return the certificate signature algorithm as a newly-allocated string.
+ * Uses X509_ALGOR from TBSCertificate signature (X509_get0_tbs_sigalg on 1.1+).
+ * [in] cert: X509 certificate
+ * [returns] allocated string; "N/A" on error
  */
-static void print_cert_sig_alg(X509 *cert)
+static char *x509_cert_sig_alg_to_utf8(X509 *cert)
 {
     const X509_ALGOR *alg = NULL;
     const ASN1_OBJECT *obj = NULL;
     char oid[128];
+    int nid;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    if (!cert)
+        return OPENSSL_strdup("N/A");
+
     alg = X509_get0_tbs_sigalg(cert);
-#endif
-    if (!alg) {
-        printf("\t\tSignature Algorithm: N/A\n");
-        return;
-    }
+    if (!alg)
+        return OPENSSL_strdup("N/A");
 
     X509_ALGOR_get0(&obj, NULL, NULL, alg);
-    if (!obj) {
-        printf("\t\tSignature Algorithm: N/A\n");
-        return;
+    if (!obj)
+        return OPENSSL_strdup("N/A");
+
+    nid = OBJ_obj2nid(obj);
+    if (nid != NID_undef) {
+        const char *ln = OBJ_nid2ln(nid);
+        return OPENSSL_strdup(ln ? ln : "N/A");
     }
 
     oid[0] = '\0';
     OBJ_obj2txt(oid, (int)sizeof(oid), obj, 1);
-
-    if (OBJ_obj2nid(obj) != NID_undef) {
-        printf("\t\tSignature Algorithm: %s\n",
-               OBJ_nid2ln(OBJ_obj2nid(obj)));
-    } else {
-        printf("\t\tSignature Algorithm: %s\n", oid);
-    }
+    return OPENSSL_strdup(oid[0] ? oid : "N/A");
 }
 
 /*
- * Print KeyUsage and ExtendedKeyUsage extensions (when present).
+ * Return KeyUsage / ExtendedKeyUsage as a newly-allocated string.
+ * [in] cert: X509 certificate
+ * [returns] allocated string; "N/A" on error
  */
-static void print_cert_key_usages(X509 *cert)
+static char *x509_cert_valid_usage_to_utf8(X509 *cert)
 {
     EXTENDED_KEY_USAGE *eku = NULL;
-    int xku = 0;
-    int i, any = 0;
+    int xku;
+    int i, n;
+    BIO *bio = NULL;
+    BUF_MEM *bptr = NULL;
+    char *out = NULL;
 
-    if (!cert) {
-        printf("\t\tValid Usage: N/A\n");
-        return;
-    }
+    if (!cert)
+        return OPENSSL_strdup("N/A");
 
     xku = X509_get_extended_key_usage(cert);
 
-    if (xku & XKU_ANYEKU) {
-        printf("\t\tValid Usage: All\n");
-        return;
-    }
+    if (xku & XKU_ANYEKU)
+        return OPENSSL_strdup("All");
 
     eku = (EXTENDED_KEY_USAGE *)X509_get_ext_d2i(cert, NID_ext_key_usage, NULL, NULL);
-    if (!eku) {
-        printf("\t\tValid Usage: N/A\n");
-        return;
-    }
+    if (!eku)
+        return OPENSSL_strdup("N/A");
 
-    int n = sk_ASN1_OBJECT_num(eku);
-    printf("\t\tValid Usage: ");
-
+    n = sk_ASN1_OBJECT_num(eku);
     if (n <= 0) {
-        printf("None\n");
-    } else {
-        for (i = 0; i < n; i++) {
-            ASN1_OBJECT *o = sk_ASN1_OBJECT_value(eku, i);
-            int nid = o ? OBJ_obj2nid(o) : NID_undef;
-
-            if (i)
-                printf(", ");
-
-            if (nid != NID_undef)
-                printf("%s", OBJ_nid2ln(nid));
-            else
-                printf("Unknown");
-        }
-        printf("\n");
+        EXTENDED_KEY_USAGE_free(eku);
+        return OPENSSL_strdup("None");
     }
 
-    EXTENDED_KEY_USAGE_free(eku);
-}
+    bio = BIO_new(BIO_s_mem());
+    if (!bio) {
+        EXTENDED_KEY_USAGE_free(eku);
+        return OPENSSL_strdup("N/A");
+    }
 
+    for (i = 0; i < n; i++) {
+        ASN1_OBJECT *o = sk_ASN1_OBJECT_value(eku, i);
+        int nid = o ? OBJ_obj2nid(o) : NID_undef;
+
+        if (i)
+            BIO_puts(bio, ", ");
+
+        if (nid != NID_undef)
+            BIO_puts(bio, OBJ_nid2ln(nid));
+        else
+            BIO_puts(bio, "Unknown");
+    }
+
+    BIO_get_mem_ptr(bio, &bptr);
+    out = OPENSSL_strndup(bptr->data, bptr->length);
+
+    BIO_free(bio);
+    EXTENDED_KEY_USAGE_free(eku);
+
+    return out ? out : OPENSSL_strdup("N/A");
+}
 
 
 /*
@@ -1978,40 +2020,59 @@ static void print_cert_key_usages(X509 *cert)
  */
 static void print_cert(X509 *cert, int i)
 {
-    char *subject, *issuer, *serial;
+    char *subject_cn, *subject, *issuer_cn, *issuer;
+    char *serial, *fp_md5, *fp_sha1, *fp_sha256, *sig_alg;
+    char *valid_usage, *not_before, *not_after;
     BIGNUM *serialbn;
 
     if (!cert)
         return;
+
+    subject_cn = x509_name_cn_to_utf8(X509_get_subject_name(cert));
     subject = x509_name_to_utf8(X509_get_subject_name(cert));
+    issuer_cn  = x509_name_cn_to_utf8(X509_get_issuer_name(cert));
     issuer = x509_name_to_utf8(X509_get_issuer_name(cert));
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
     serial = BN_bn2hex(serialbn);
+    fp_md5 = x509_cert_fingerprint_hex(cert, EVP_md5());
+    fp_sha1 = x509_cert_fingerprint_hex(cert, EVP_sha1());
+    fp_sha256 = x509_cert_fingerprint_hex(cert, EVP_sha256());
+    sig_alg = x509_cert_sig_alg_to_utf8(cert);
+    valid_usage = x509_cert_valid_usage_to_utf8(cert);
+    not_before = asn1_time_to_utf8(X509_get0_notBefore(cert));
+    not_after = asn1_time_to_utf8(X509_get0_notAfter(cert));
+
     printf("\t------------------\n");
     printf("\tSigner #%d:\n", i);
-    print_name_cn("Subject", X509_get_subject_name(cert));
-    printf("\t\t\tSubject Full: %s\n", subject);
-    print_name_cn("Issuer", X509_get_issuer_name(cert));
-    printf("\t\t\tIssuer Full: %s\n", issuer);
+    printf("\t\tSubject CN: %s\n", subject_cn);
+    printf("\t\tSubject: %s\n", subject);
+    printf("\t\tIssuer CN: %s\n", issuer_cn);
+    printf("\t\tIssuer: %s\n", issuer);
     printf("\t\tSerial : %s\n", serial);
-    print_cert_sig_alg(cert);
-    printf("\t\tFingerprints:\n");
-    print_cert_fingerprint(cert, EVP_md5(), "MD5");
-    print_cert_fingerprint(cert, EVP_sha1(), "SHA1");
-    print_cert_fingerprint(cert, EVP_sha256(), "SHA256");
-    print_cert_key_usages(cert);
+    printf("\t\tSignature Algorithm: %s\n", sig_alg);
+    printf("\t\tMD5 Fingerprint: %s\n", fp_md5);
+    printf("\t\tSHA1 Fingerprint: %s\n", fp_sha1);
+    printf("\t\tSHA256 Fingerprint: %s\n", fp_sha256);
+    printf("\t\tValid Usage: %s\n", valid_usage);
     printf("\n\t\tCertificate expiration date:\n");
-    printf("\t\t\tnotBefore : ");
-    print_asn1_time(X509_get0_notBefore(cert));
-    printf("\t\t\tnotAfter : ");
-    print_asn1_time(X509_get0_notAfter(cert));
+    printf("\t\t\tnotBefore: %s\n", not_before);
+    printf("\t\t\tnotAfter: %s\n", not_after);
     printf("\n");
 
 
+    OPENSSL_free(subject_cn);
+    OPENSSL_free(issuer_cn);
     OPENSSL_free(subject);
     OPENSSL_free(issuer);
     BN_free(serialbn);
     OPENSSL_free(serial);
+    OPENSSL_free(fp_md5);
+    OPENSSL_free(fp_sha1);
+    OPENSSL_free(fp_sha256);
+    OPENSSL_free(sig_alg);
+    OPENSSL_free(valid_usage);
+    OPENSSL_free(not_before);
+    OPENSSL_free(not_after);
 }
 
 /*
