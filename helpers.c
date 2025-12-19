@@ -7,6 +7,7 @@
 
 #include "osslsigncode.h"
 #include "helpers.h"
+#include "outjson.h"
 
 /* Prototypes */
 static SpcSpOpusInfo *spc_sp_opus_info_create(FILE_FORMAT_CTX *ctx);
@@ -461,6 +462,14 @@ void print_hash(const char *descript1, const char *descript2, const u_char *mdbu
 #endif /* WIN32 */
     }
     printf("%s: %s %s\n", descript1, hexbuf, descript2);
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+        if (!strcmp(descript1, "Current message digest    ")) {
+            outjson_sig_set_message_digest_current(outjson_sig_curr_get(), hexbuf);
+        } else if (!strcmp(descript1, "Calculated message digest ")) {
+            outjson_sig_set_message_digest_calculated(outjson_sig_curr_get(), hexbuf);
+        }
+    }
+
     OPENSSL_free(hexbuf);
 }
 
@@ -557,6 +566,9 @@ int compare_digests(u_char *mdbuf, u_char *cmdbuf, int mdtype)
 {
     int mdlen = EVP_MD_size(EVP_get_digestbynid(mdtype));
     int mdok = !memcmp(mdbuf, cmdbuf, (size_t)mdlen);
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+            outjson_sig_set_digest_algorithm(outjson_sig_curr_get(), OBJ_nid2sn(mdtype));
+        }
     printf("Message digest algorithm  : %s\n", OBJ_nid2sn(mdtype));
     print_hash("Current message digest    ", "", mdbuf, mdlen);
     print_hash("Calculated message digest ", mdok ? "\n" : "    MISMATCH!!!\n", cmdbuf, mdlen);

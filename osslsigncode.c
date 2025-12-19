@@ -60,6 +60,7 @@
 
 #include "osslsigncode.h"
 #include "helpers.h"
+#include "outjson.h"
 
 /*
  * $ echo -n 3006030200013000 | xxd -r -p | openssl asn1parse -i -inform der
@@ -2737,14 +2738,38 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     }
     if (time != INVALID_TIME) {
         printf("Signature verification time: ");
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+            ASN1_TIME *at = ASN1_TIME_set(NULL, time);
+            if (at) {
+                char *t = asn1_time_to_utf8(at);
+                if (t) {
+                    outjson_sig_set_signing_time(outjson_sig_curr_get(), t);
+                    OPENSSL_free(t);
+                }
+                ASN1_TIME_free(at);
+            }
+        }
         print_time_t(time);
+        // get signing time from here
         if (!x509_store_set_time(store, time)) {
             fprintf(stderr, "Failed to set signature time\n");
             goto out;
         }
     } else if (ctx->options->time != INVALID_TIME) {
         printf("Signature verification time: ");
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+            ASN1_TIME *at = ASN1_TIME_set(NULL, time);
+            if (at) {
+                char *t = asn1_time_to_utf8(at);
+                if (t) {
+                    outjson_sig_set_signing_time(outjson_sig_curr_get(), t);
+                    OPENSSL_free(t);
+                }
+                ASN1_TIME_free(at);
+            }
+        }
         print_time_t(ctx->options->time);
+        // get signing time from here
         if (!x509_store_set_time(store, ctx->options->time)) {
             fprintf(stderr, "Failed to set verifying time\n");
             goto out;
@@ -3024,6 +3049,9 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
                     desc = OPENSSL_strdup((char *)opus->programName->value.ascii->data);
                 }
                 if (desc) {
+                    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+                        outjson_sig_set_text_description(outjson_sig_curr_get(), desc);
+                    }
                     printf("\tText description: %s\n", desc);
                     OPENSSL_free(desc);
                 }
@@ -3152,6 +3180,9 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
     /* Signature */
     if (verbose) {
         md_nid = OBJ_obj2nid(si->digest_enc_alg->algorithm);
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+            outjson_sig_set_digest_encryption_algorithm(outjson_sig_curr_get(), (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
+        }
         printf("\nDigest encryption algorithm: %s\n",
             (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
         print_hash("Signature", "", ASN1_STRING_get0_data(si->enc_digest), ASN1_STRING_length(si->enc_digest));
@@ -3375,6 +3406,9 @@ static int verify_content_member_digest(FILE_FORMAT_CTX *ctx, ASN1_TYPE *content
         SpcIndirectDataContent_free(idc);
         return 1; /* FAILED */
     } else {
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+            outjson_sig_set_digest_algorithm(outjson_sig_curr_get(), OBJ_nid2sn(mdtype));
+        }
         printf("Message digest algorithm  : %s\n", OBJ_nid2sn(mdtype));
         print_hash("Current message digest    ", "", mdbuf, mdlen);
         print_hash("Calculated message digest ", "\n", cmdbuf, mdlen);
@@ -3499,6 +3533,9 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
     } else
         printf("\nTimestamp is not available\n\n");
     verok = verify_authenticode(ctx, p7, time, signer);
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+        outjson_sig_set_verified(outjson_sig_curr_get(), verok ? 1 : 0);
+    }
     printf("Signature verification: %s\n\n", verok ? "ok" : "failed");
     if (!verok)
         return 1; /* FAILED */
@@ -3516,6 +3553,8 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
     PKCS7 *p7;
     STACK_OF(PKCS7) *signatures = NULL;
     int detached = options->catalog ? 1 : 0;
+
+    if (outjson_global_is_enabled() && !outjson_global_begin()) { fprintf(stderr,"JSON object failed to init\n"); return 1; }
 
     if (detached) {
         GLOBAL_OPTIONS *cat_options;
@@ -3570,6 +3609,8 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
             continue;
         }
         sig = sk_PKCS7_value(signatures, i);
+        if (outjson_global_is_enabled())
+            outjson_sig_begin(outjson_global_get(), i);
         if (detached) {
             if (!verify_content(ctx, sig)) {
                 ret &= verify_signature(ctx, sig);
@@ -3587,7 +3628,11 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
             fprintf(stderr, "Unsupported method: verify_digests\n");
             return 1; /* FAILED */
         }
+        if (outjson_global_is_enabled() && outjson_sig_has_curr())
+            outjson_sig_finish();
     }
+    if (outjson_global_is_enabled())
+        outjson_set_verified_signature_count(outjson_global_get(), verified);
     printf("Number of verified signatures: %d\n", verified);
     sk_PKCS7_pop_free(signatures, PKCS7_free);
     if (ret)
@@ -5162,6 +5207,9 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->catalog = *(++argv);
+        } else if ((cmd == CMD_VERIFY) && (!strcmp(*argv, "-json"))) {
+            outjson_global_enable();
+            if (!outjson_global_begin()) { fprintf(stderr,"out of memory\n"); return 1; }
         } else if ((cmd == CMD_VERIFY || cmd == CMD_ATTACH) && !strcmp(*argv, "-CAfile")) {
             if (--argc < 1) {
                 usage(argv0, "all");
@@ -5615,6 +5663,7 @@ err_cleanup:
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
     providers_cleanup();
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
+    outjson_global_finish_and_print(stdout);
     if (ret)
         ERR_print_errors_fp(stderr);
     if (options.cmd == CMD_HELP)

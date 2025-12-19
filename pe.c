@@ -10,6 +10,7 @@
 
 #include "osslsigncode.h"
 #include "helpers.h"
+#include "outjson.h"
 
 const u_char classid_page_hash[] = {
     0xa6, 0xb5, 0x86, 0xd5, 0xb4, 0xa1, 0x24, 0x66,
@@ -1197,6 +1198,8 @@ static int pe_check_file(FILE_FORMAT_CTX *ctx)
     real_pe_checksum = pe_calc_realchecksum(ctx);
     if (ctx->pe_ctx->pe_checksum == real_pe_checksum) {
         printf("PE checksum   : %08X\n", real_pe_checksum);
+        if (outjson_global_is_enabled())
+            outjson_set_pe_checksum(outjson_global_get(), real_pe_checksum);
     } else {
         printf("Current PE checksum   : %08X\n", ctx->pe_ctx->pe_checksum);
         printf("Calculated PE checksum: %08X\n", real_pe_checksum);
