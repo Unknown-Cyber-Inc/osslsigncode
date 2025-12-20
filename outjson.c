@@ -484,6 +484,7 @@ static cJSON *json_sig(const outjson_signature *sig) {
 int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
     if (!vj || !fp) return 0;
 
+    fputs("Starting JSON output\n", fp);
     cJSON *root = cJSON_CreateObject();
     if (!root) return 0;
 
@@ -527,5 +528,6 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
 
     free(out);
     cJSON_Delete(root);
+    fputs("Finished JSON output\n", fp);
     return 1;
 }
