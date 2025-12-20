@@ -344,6 +344,7 @@ outjson_certificate *outjson_cert_new(
 
     c->not_before = xstrdup0(not_before ? not_before : "");
     c->not_after = xstrdup0(not_after ? not_after : "");
+    c->valid_usage = xstrdup0(valid_usage ? valid_usage : "");
 
     if (!c->subject_cn || !c->subject || !c->issuer_cn || !c->issuer || !c->serial ||
         !c->signature_algo || !c->fp_md5 || !c->fp_sha1 || !c->fp_sha256 ||

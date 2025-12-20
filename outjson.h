@@ -23,7 +23,6 @@ typedef struct outjson_certificate_st {
     char *not_after;
 
     char *valid_usage;
-    size_t valid_usage_count;
 
     /* internal: used for dedup in x509_certs */
     char *dedup_key;
