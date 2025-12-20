@@ -22,7 +22,7 @@ typedef struct outjson_certificate_st {
     char *not_before;
     char *not_after;
 
-    char **valid_usage;
+    char *valid_usage;
     size_t valid_usage_count;
 
     /* internal: used for dedup in x509_certs */
@@ -42,8 +42,8 @@ typedef struct outjson_signature_st {
     outjson_certificate **signers;
     size_t signers_count;
 
-    outjson_certificate **counter_signers;
-    size_t counter_signers_count;
+    outjson_certificate **countersigners;
+    size_t countersigners_count;
 
     int verified; /* 0/1 */
 
@@ -52,7 +52,7 @@ typedef struct outjson_signature_st {
 } outjson_signature;
 
 typedef struct outjson_verify_st {
-    uint32_t pe_checksum;
+    char *pe_checksum;
 
     int verified_signature_count;
 
@@ -136,12 +136,10 @@ outjson_certificate *outjson_cert_new(
     const char *fp_md5,
     const char *fp_sha1,
     const char *fp_sha256,
+    const char *valid_usage,
     const char *not_before,
     const char *not_after
 );
-
-/* Provide a comma-separated usage string like "Unknown, Code Signing" */
-void outjson_cert_set_valid_usage_csv(outjson_certificate *cert, const char *csv);
 
 /* Free a certificate. (Normally called by outjson_verify_free via ownership rules.) */
 void outjson_cert_free(outjson_certificate *cert);

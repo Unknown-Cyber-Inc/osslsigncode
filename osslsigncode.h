@@ -244,6 +244,15 @@ typedef enum {
     CMD_DEFAULT
 } cmd_type_t;
 
+typedef enum {
+    CERT_SIGNER,
+    CERT_SIGNER_CHAIN,
+    CERT_COUNTERSIGNER,
+    CERT_CRL,
+    CERT_X509,
+    CERT_OTHER
+} cert_type_t;
+
 typedef unsigned char u_char;
 
 #ifndef OPENSSL_NO_ENGINE

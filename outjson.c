@@ -184,7 +184,7 @@ void outjson_verify_free(outjson_verify *vj) {
 
             free_str_list(sig->errors, sig->errors_count);
             free(sig->signers);
-            free(sig->counter_signers);
+            free(sig->countersigners);
             xfree0(sig->digest_algorithm);
             xfree0(sig->digest_encryption_algorithm);
             xfree0(sig->message_digest_current);
@@ -212,7 +212,13 @@ void outjson_verify_free(outjson_verify *vj) {
 
 /* -------- setters -------- */
 
-void outjson_set_pe_checksum(outjson_verify *vj, uint32_t checksum) { if (vj) (vj->pe_checksum = checksum); }
+void outjson_set_pe_checksum(outjson_verify *vj, uint32_t checksum) {
+    if (vj) {
+        char checksum_hex[9];
+        sprintf(checksum_hex, "%08X", checksum);
+        set_str_once(&vj->pe_checksum, checksum_hex);
+    }
+}
 void outjson_set_signed(outjson_verify *vj, int flag) { if (vj) vj->signed_flag = flag ? 1 : 0; }
 void outjson_set_valid(outjson_verify *vj, int flag) { if (vj) vj->valid_flag = flag ? 1 : 0; }
 void outjson_set_verified_signature_count(outjson_verify *vj, int count) { if (vj) vj->verified_signature_count = count; }
@@ -223,9 +229,13 @@ void outjson_add_error(outjson_verify *vj, const char *msg) {
 }
 
 /* -------- signature -------- */
-
 outjson_signature *outjson_sig_begin(outjson_verify *vj, int index) {
     if (!vj) return NULL;
+
+    /* File has a signature, mark it as signed */
+    if (!vj->signed_flag)
+        outjson_set_signed(vj, 1);
+
     outjson_signature *sig = (outjson_signature *)calloc(1, sizeof(outjson_signature));
     if (!sig) return NULL;
     sig->index = index;
@@ -295,7 +305,7 @@ void outjson_sig_add_signer(outjson_verify *vj, outjson_signature *sig,
 void outjson_sig_add_countersigner(outjson_verify *vj, outjson_signature *sig,
                                    outjson_certificate *cert, int add_global) {
     if (!vj || !sig || !cert) return;
-    (void)arr_push_ptr((void ***)&sig->counter_signers, &sig->counter_signers_count, cert);
+    (void)arr_push_ptr((void ***)&sig->countersigners, &sig->countersigners_count, cert);
     if (add_global) (void)outjson_add_x509_cert_dedup(vj, cert);
 }
 
@@ -312,6 +322,7 @@ outjson_certificate *outjson_cert_new(
     const char *fp_md5,
     const char *fp_sha1,
     const char *fp_sha256,
+    const char *valid_usage,
     const char *not_before,
     const char *not_after
 ) {
@@ -350,36 +361,6 @@ outjson_certificate *outjson_cert_new(
     return c;
 }
 
-void outjson_cert_set_valid_usage_csv(outjson_certificate *cert, const char *csv) {
-    if (!cert) return;
-
-    /* clear existing */
-    free_str_list(cert->valid_usage, cert->valid_usage_count);
-    cert->valid_usage = NULL;
-    cert->valid_usage_count = 0;
-
-    if (!csv || csv[0] == '\0') return;
-
-    char *tmp = xstrdup0(csv);
-    if (!tmp) return;
-
-    char *p = tmp;
-    while (p && *p) {
-        char *comma = strchr(p, ',');
-        if (comma) *comma = '\0';
-
-        char *tok = trim(p);
-        if (tok && tok[0] != '\0') {
-            (void)arr_push_str(&cert->valid_usage, &cert->valid_usage_count, tok);
-        }
-
-        if (!comma) break;
-        p = comma + 1;
-    }
-
-    free(tmp);
-}
-
 void outjson_cert_free(outjson_certificate *cert) {
     if (!cert) return;
 
@@ -397,7 +378,7 @@ void outjson_cert_free(outjson_certificate *cert) {
     xfree0(cert->not_before);
     xfree0(cert->not_after);
 
-    free_str_list(cert->valid_usage, cert->valid_usage_count);
+    xfree0(cert->valid_usage);
 
     xfree0(cert->dedup_key);
 
@@ -446,13 +427,7 @@ static cJSON *json_cert(const outjson_certificate *c) {
 
     cJSON_AddStringToObject(o, "not_before", (c && c->not_before) ? c->not_before : "");
     cJSON_AddStringToObject(o, "not_after", (c && c->not_after) ? c->not_after : "");
-
-    cJSON *vu = cJSON_AddArrayToObject(o, "valid_usage");
-    if (vu && c) {
-        for (size_t i = 0; i < c->valid_usage_count; i++) {
-            cJSON_AddItemToArray(vu, cJSON_CreateString(c->valid_usage[i] ? c->valid_usage[i] : ""));
-        }
-    }
+    cJSON_AddStringToObject(o, "valid_usage", (c && c->valid_usage ? c->valid_usage : ""));
 
     return o;
 }
@@ -485,11 +460,11 @@ static cJSON *json_sig(const outjson_signature *sig) {
         }
     }
 
-    /* counter_signers array */
-    cJSON *cs = cJSON_AddArrayToObject(o, "counter_signers");
+    /* countersigners array */
+    cJSON *cs = cJSON_AddArrayToObject(o, "countersigners");
     if (cs && sig) {
-        for (size_t i = 0; i < sig->counter_signers_count; i++) {
-            cJSON_AddItemToArray(cs, json_cert(sig->counter_signers[i]));
+        for (size_t i = 0; i < sig->countersigners_count; i++) {
+            cJSON_AddItemToArray(cs, json_cert(sig->countersigners[i]));
         }
     }
 
@@ -511,7 +486,7 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return 0;
 
-    cJSON_AddNumberToObject(root, "pe_checksum", (double)vj->pe_checksum);
+    cJSON_AddStringToObject(root, "pe_checksum", vj->pe_checksum);
     cJSON_AddNumberToObject(root, "verified_signature_count", vj->verified_signature_count);
 
     cJSON *sigs = cJSON_AddArrayToObject(root, "signatures");
@@ -524,7 +499,9 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
     cJSON *x509 = cJSON_AddArrayToObject(root, "x509_certs");
     if (x509) {
         for (size_t i = 0; i < vj->x509_certs_count; i++) {
-            cJSON_AddItemToArray(x509, json_cert(vj->x509_certs[i]));
+            /* Don't add root certs to the x509 cert list */
+            if (strcmp(vj->x509_certs[i]->issuer_cn, vj->x509_certs[i]->subject_cn))
+                cJSON_AddItemToArray(x509, json_cert(vj->x509_certs[i]));
         }
     }
 

@@ -242,13 +242,23 @@ static int X509_attribute_chain_append_object(STACK_OF(X509_ATTRIBUTE) **unauth_
 static STACK_OF(PKCS7) *signature_list_create(PKCS7 *p7);
 static int PKCS7_compare(const PKCS7 *const *a, const PKCS7 *const *b);
 static PKCS7 *pkcs7_get_sigfile(FILE_FORMAT_CTX *ctx);
-static void print_cert(X509 *cert, int i);
+static void print_cert(X509 *cert, int i, cert_type_t t);
 static int x509_store_load_crlfile(X509_STORE *store, char *cafile, char *crlfile);
 static void load_objects_from_store(const char *url, char *pass, EVP_PKEY **pkey, STACK_OF(X509) *certs, STACK_OF(X509_CRL) *crls);
 static BIO *bio_new_file(const char *filename, const char *mode);
 #ifndef OPENSSL_NO_ENGINE
 static void engine_control_set(GLOBAL_OPTIONS *options, const char *arg);
 #endif /* OPENSSL_NO_ENGINE */
+static int g_store_ex_idx = -1;
+static void store_ex_init_once(void)
+{
+    if (g_store_ex_idx >= 0)
+        return;
+
+    g_store_ex_idx = X509_STORE_get_ex_new_index(
+        0, NULL, NULL, NULL, NULL
+    );
+}
 
 
 /*
@@ -777,7 +787,7 @@ static int verify_callback(int ok, X509_STORE_CTX *ctx)
     if (!ok) {
         int error = X509_STORE_CTX_get_error(ctx);
 
-        print_cert(X509_STORE_CTX_get_current_cert(ctx), 0);
+        print_cert(X509_STORE_CTX_get_current_cert(ctx), 0, CERT_CRL);
         if (error == X509_V_ERR_UNABLE_TO_GET_CRL) {
             char *url = clrdp_url_get_x509(X509_STORE_CTX_get_current_cert(ctx));
 
@@ -2019,12 +2029,13 @@ static char *x509_cert_valid_usage_to_utf8(X509 *cert)
  * [in] i: certificate number in order
  * [returns] none
  */
-static void print_cert(X509 *cert, int i)
+static void print_cert(X509 *cert, int i, cert_type_t t)
 {
     char *subject_cn, *subject, *issuer_cn, *issuer;
     char *serial, *fp_md5, *fp_sha1, *fp_sha256, *sig_alg;
     char *valid_usage, *not_before, *not_after;
     BIGNUM *serialbn;
+    outjson_certificate *new_cert;
 
     if (!cert)
         return;
@@ -2042,6 +2053,48 @@ static void print_cert(X509 *cert, int i)
     valid_usage = x509_cert_valid_usage_to_utf8(cert);
     not_before = asn1_time_to_utf8(X509_get0_notBefore(cert));
     not_after = asn1_time_to_utf8(X509_get0_notAfter(cert));
+
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+        if (t == CERT_SIGNER || t == CERT_SIGNER_CHAIN || t == CERT_COUNTERSIGNER) {
+            new_cert = outjson_cert_new(
+                i,
+                subject_cn,
+                subject,
+                issuer_cn,
+                issuer,
+                serial,
+                sig_alg,
+                fp_md5,
+                fp_sha1,
+                fp_sha256,
+                valid_usage,
+                not_before,
+                not_after
+            );
+            if (t == CERT_SIGNER) {
+                outjson_sig_set_original_signer(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            } else if (t == CERT_COUNTERSIGNER){
+                outjson_sig_add_countersigner(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            } else if (t == CERT_SIGNER_CHAIN){
+                outjson_sig_add_signer(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            }
+        }
+    }
 
     printf("\t------------------\n");
     printf("\tSigner #%d:\n", i);
@@ -2085,7 +2138,7 @@ static void print_certs_chain(STACK_OF(X509) *certs)
     int i;
 
     for (i=0; i<sk_X509_num(certs); i++) {
-        print_cert(sk_X509_value(certs, i), i);
+        print_cert(sk_X509_value(certs, i), i, CERT_OTHER);
     }
 }
 
@@ -2167,7 +2220,14 @@ static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
     int depth = X509_STORE_CTX_get_error_depth(ctx);
 
     X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
-    print_cert(current_cert, depth);
+    X509_STORE *store = X509_STORE_CTX_get0_store(ctx);
+    cert_type_t t = CERT_OTHER;
+
+    if (store && g_store_ex_idx >= 0) {
+        void *p = X509_STORE_get_ex_data(store, g_store_ex_idx);
+        if (p) t = (cert_type_t)(intptr_t)p;
+    }
+    print_cert(current_cert, depth, t);
     if (!ok) {
         if (trusted_cert(current_cert, error)) {
             return 1;
@@ -2187,7 +2247,7 @@ static int verify_crl_callback(int ok, X509_STORE_CTX *ctx)
     int depth = X509_STORE_CTX_get_error_depth(ctx);
 
     X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
-    print_cert(current_cert, depth);
+    print_cert(current_cert, depth, CERT_CRL);
     if (!ok) {
         if (trusted_cert(current_cert, error)) {
             return 1;
@@ -2561,6 +2621,8 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
             fprintf(stderr, "Failed to set store time\n");
             goto out;
         }
+        store_ex_init_once();
+        X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_COUNTERSIGNER);
     } else {
         printf("Use the \"-TSA-CAfile\" option to add the Time-Stamp Authority certificates bundle to verify the Timestamp Server.\n");
         goto out;
@@ -2736,6 +2798,8 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
         fprintf(stderr, "Failed to add store lookup file\n");
         goto out;
     }
+    store_ex_init_once();
+    X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_SIGNER_CHAIN);
     if (time != INVALID_TIME) {
         printf("Signature verification time: ");
         if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
@@ -3497,7 +3561,7 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
     signer = sk_X509_value(signers, 0);
     sk_X509_free(signers);
     printf("Signer's certificate:\n");
-    print_cert(signer, 0);
+    print_cert(signer, 0, CERT_SIGNER);
 
     time = time_t_timestamp_get_attributes(&timestamp, p7, ctx->options->verbose);
     if (ctx->options->leafhash != NULL) {
@@ -5663,6 +5727,8 @@ err_cleanup:
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
     providers_cleanup();
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
+    if (!ret)
+        outjson_set_valid(outjson_global_get(), 1);
     outjson_global_finish_and_print(stdout);
     if (ret)
         ERR_print_errors_fp(stderr);
