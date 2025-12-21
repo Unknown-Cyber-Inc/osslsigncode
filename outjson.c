@@ -1,10 +1,7 @@
 #include "outjson.h"
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
 #include "cJSON.h"
 
-/* JSON Object globals*/
+/* ----------------- JSON Object globals ----------------- */
 static outjson_verify *g_vj = NULL;
 static int g_enabled = 0;
 
@@ -21,6 +18,7 @@ int outjson_global_begin(void) {
 
 void outjson_global_finish_and_print(FILE *fp) {
     if (!g_enabled || !g_vj) return;
+    outjson_verify_collect_signature_errors(g_vj);
     outjson_verify_print(g_vj, fp);
     outjson_verify_free(g_vj);
     g_vj = NULL;
@@ -35,7 +33,7 @@ void outjson_global_disable(void) {
     g_enabled = 0;
 }
 
-/* Signature globals */
+/* ----------------- Signature globals ----------------- */
 static outjson_signature *g_sig_cur = NULL;
 static int sig_has_curr = 0;
 
@@ -102,7 +100,13 @@ static void free_str_list(char **arr, size_t cnt) {
     free(arr);
 }
 
-/* Trim leading/trailing spaces in-place; returns pointer to first non-space. */
+static void outjson_error_group_free(outjson_error_group *g)
+{
+    if (!g) return;
+    free_str_list(g->errors, g->errors_count);
+    free(g);
+}
+
 static char *trim(char *s) {
     if (!s) return s;
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
@@ -124,7 +128,6 @@ static void set_str(char **dst, const char *src) {
     *dst = xstrdup0(src ? src : "");
 }
 
-/* first-wins setter (matches your “top-level signature 0 drives fields” behavior) */
 static void set_str_once(char **dst, const char *src) {
     if (*dst && (*dst)[0] != '\0') return;
     set_str(dst, src);
@@ -161,15 +164,34 @@ static int seen_key(const outjson_verify *vj, const char *key) {
     return 0;
 }
 
+static outjson_error_group *get_or_create_signature_error_group(outjson_verify *vj, int sig_index)
+{
+    if (!vj) return NULL;
+
+    for (size_t i = 0; i < vj->signature_errors_count; i++) {
+        outjson_error_group *g = vj->signature_errors[i];
+        if (g && g->signature_index == sig_index)
+            return g;
+    }
+
+    outjson_error_group *g = (outjson_error_group *)calloc(1, sizeof(outjson_error_group));
+    if (!g) return NULL;
+    g->signature_index = sig_index;
+
+    if (!arr_push_ptr((void ***)&vj->signature_errors, &vj->signature_errors_count, g)) {
+        outjson_error_group_free(g);
+        return NULL;
+    }
+    return g;
+}
+
 /* ----------------- API impl ----------------- */
 
 outjson_verify *outjson_verify_new(void) {
     outjson_verify *vj = (outjson_verify *)calloc(1, sizeof(outjson_verify));
     if (!vj) return NULL;
 
-    /* initialize strings as empty (not NULL) so JSON always outputs strings */
     vj->pe_checksum = 0;
-
     return vj;
 }
 
@@ -204,7 +226,14 @@ void outjson_verify_free(outjson_verify *vj) {
         free(vj->x509_certs);
     }
 
-    /* top-level errors */
+    /* signature_errors (grouped) */
+    if (vj->signature_errors) {
+        for (size_t i = 0; i < vj->signature_errors_count; i++) {
+            outjson_error_group_free(vj->signature_errors[i]);
+        }
+        free(vj->signature_errors);
+    }
+
     free_str_list(vj->errors, vj->errors_count);
 
     free(vj);
@@ -225,6 +254,7 @@ void outjson_set_verified_signature_count(outjson_verify *vj, int count) { if (v
 
 void outjson_add_error(outjson_verify *vj, const char *msg) {
     if (!vj) return;
+
     (void)arr_push_str(&vj->errors, &vj->errors_count, msg ? msg : "");
 }
 
@@ -258,6 +288,20 @@ void outjson_sig_set_verified(outjson_signature *sig, int flag) {
 void outjson_sig_add_error(outjson_signature *sig, const char *msg) {
     if (!sig) return;
     (void)arr_push_str(&sig->errors, &sig->errors_count, msg ? msg : "");
+}
+
+void outjson_sig_add_openssl_errors(outjson_signature *sig)
+{
+    unsigned long err;
+    char buf[256];
+
+    if (!sig)
+        return;
+
+    while ((err = ERR_get_error()) != 0) {
+        ERR_error_string_n(err, buf, sizeof(buf));
+        outjson_sig_add_error(sig, buf);
+    }
 }
 
 void outjson_sig_set_digest_algorithm(outjson_signature *sig, const char *s) {
@@ -307,6 +351,76 @@ void outjson_sig_add_countersigner(outjson_verify *vj, outjson_signature *sig,
     if (!vj || !sig || !cert) return;
     (void)arr_push_ptr((void ***)&sig->countersigners, &sig->countersigners_count, cert);
     if (add_global) (void)outjson_add_x509_cert_dedup(vj, cert);
+}
+
+/* ----------------- wrapper functions ----------------- */
+
+void outfmt_ERR_print_errors_fp(FILE *fp)
+{
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+        outjson_sig_add_openssl_errors(outjson_sig_curr_get());
+        return;
+    }
+    #undef ERR_print_errors_fp
+    ERR_print_errors_fp(fp ? fp : stderr);
+}
+
+int outfmt_err_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+
+    if (outjson_global_is_enabled()) {
+        outjson_verify *vj = outjson_global_get();
+
+        if (vj) {
+            va_list ap2;
+            va_copy(ap2, ap);
+
+            int needed = vsnprintf(NULL, 0, fmt ? fmt : "", ap2);
+            va_end(ap2);
+
+            if (needed < 0) {
+                outjson_add_error(vj, "stderr formatting error");
+                va_end(ap);
+                return 0;
+            }
+
+            char *buf = (char *)malloc((size_t)needed + 1);
+            if (!buf) {
+                outjson_add_error(vj, "stderr OOM");
+                va_end(ap);
+                return 0;
+            }
+
+            vsnprintf(buf, (size_t)needed + 1, fmt ? fmt : "", ap);
+            outjson_add_error(vj, buf);
+            free(buf);
+
+            va_end(ap);
+            return needed;
+        }
+    }
+
+    #undef fprintf
+    int r = vfprintf(stderr, fmt ? fmt : "", ap);
+    va_end(ap);
+    return r;
+}
+
+void outfmt_misc_sigerr_printf(const char *msg, ...)
+{
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+        char buf[1024];
+
+        va_list ap;
+        va_start(ap, msg);
+        vsnprintf(buf, sizeof(buf), msg ? msg : "", ap);
+        va_end(ap);
+
+        outjson_sig_add_error(outjson_sig_curr_get(), buf);
+        return;
+    }
 }
 
 /* -------- certificate -------- */
@@ -398,7 +512,7 @@ static cJSON *json_cert(const outjson_certificate *c) {
     cJSON *o = cJSON_CreateObject();
     if (!o) return NULL;
 
-    cJSON_AddNumberToObject(o, "signer_index", c ? c->signer_index : 0);
+    cJSON_AddNumberToObject(o, "index", c ? c->signer_index : 0);
     cJSON_AddStringToObject(o, "subject_cn", (c && c->subject_cn) ? c->subject_cn : "");
     cJSON_AddStringToObject(o, "subject", (c && c->subject) ? c->subject : "");
     cJSON_AddStringToObject(o, "issuer_cn", (c && c->issuer_cn) ? c->issuer_cn : "");
@@ -406,7 +520,6 @@ static cJSON *json_cert(const outjson_certificate *c) {
     cJSON_AddStringToObject(o, "serial", (c && c->serial) ? c->serial : "");
     cJSON_AddStringToObject(o, "signature_algo", (c && c->signature_algo) ? c->signature_algo : "");
 
-    /* fingerprints: array of 3 objects */
     cJSON *fps = cJSON_AddArrayToObject(o, "fingerprints");
     if (fps) {
         cJSON *m = cJSON_CreateObject();
@@ -445,15 +558,12 @@ static cJSON *json_sig(const outjson_signature *sig) {
     cJSON_AddStringToObject(o, "signing_time", sig->signing_time ? sig->signing_time : "");
     cJSON_AddStringToObject(o, "text_description", sig->text_description ? sig->text_description : "");
 
-    /* original_signer */
     if (sig && sig->original_signer) {
         cJSON_AddItemToObject(o, "original_signer", json_cert(sig->original_signer));
     } else {
-        /* keep schema stable */
         cJSON_AddNullToObject(o, "original_signer");
     }
 
-    /* signers array */
     cJSON *signers = cJSON_AddArrayToObject(o, "signers");
     if (signers && sig) {
         for (size_t i = 0; i < sig->signers_count; i++) {
@@ -461,7 +571,6 @@ static cJSON *json_sig(const outjson_signature *sig) {
         }
     }
 
-    /* countersigners array */
     cJSON *cs = cJSON_AddArrayToObject(o, "countersigners");
     if (cs && sig) {
         for (size_t i = 0; i < sig->countersigners_count; i++) {
@@ -481,10 +590,29 @@ static cJSON *json_sig(const outjson_signature *sig) {
     return o;
 }
 
+void outjson_verify_collect_signature_errors(outjson_verify *vj)
+{
+    if (!vj || !vj->signatures)
+        return;
+
+    for (size_t i = 0; i < vj->signatures_count; i++) {
+        outjson_signature *sig = vj->signatures[i];
+        if (!sig || !sig->errors || sig->errors_count == 0)
+            continue;
+
+        outjson_error_group *g = get_or_create_signature_error_group(vj, sig->index);
+        if (!g) continue;
+
+        for (size_t j = 0; j < sig->errors_count; j++) {
+            const char *msg = sig->errors[j] ? sig->errors[j] : "";
+            (void)arr_push_str(&g->errors, &g->errors_count, msg);
+        }
+    }
+}
+
 int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
     if (!vj || !fp) return 0;
 
-    fputs("Starting JSON output\n", fp);
     cJSON *root = cJSON_CreateObject();
     if (!root) return 0;
 
@@ -510,7 +638,31 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
     cJSON_AddBoolToObject(root, "signed", vj->signed_flag ? 1 : 0);
     cJSON_AddBoolToObject(root, "valid", vj->valid_flag ? 1 : 0);
 
-    cJSON *errs = cJSON_AddArrayToObject(root, "errors");
+    cJSON *sig_errs = cJSON_AddArrayToObject(root, "signature_errors");
+    if (sig_errs) {
+        for (size_t i = 0; i < vj->signature_errors_count; i++) {
+            outjson_error_group *g = vj->signature_errors[i];
+            if (!g || !g->errors || g->errors_count == 0)
+                continue;
+
+            cJSON *obj = cJSON_CreateObject();
+            cJSON *arr = cJSON_CreateArray();
+            if (!obj || !arr) {
+                if (arr) cJSON_Delete(arr);
+                if (obj) cJSON_Delete(obj);
+                continue;
+            }
+
+            cJSON_AddNumberToObject(obj, "index", g->signature_index);
+            for (size_t j = 0; j < g->errors_count; j++) {
+                cJSON_AddItemToArray(arr, cJSON_CreateString(g->errors[j] ? g->errors[j] : ""));
+            }
+            cJSON_AddItemToObject(obj, "errors", arr);
+            cJSON_AddItemToArray(sig_errs, obj);
+        }
+    }
+
+    cJSON *errs = cJSON_AddArrayToObject(root, "cmd_errors");
     if (errs) {
         for (size_t i = 0; i < vj->errors_count; i++) {
             cJSON_AddItemToArray(errs, cJSON_CreateString(vj->errors[i] ? vj->errors[i] : ""));
@@ -528,6 +680,5 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
 
     free(out);
     cJSON_Delete(root);
-    fputs("Finished JSON output\n", fp);
     return 1;
 }

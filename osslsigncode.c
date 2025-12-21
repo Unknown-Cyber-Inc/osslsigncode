@@ -2234,8 +2234,11 @@ static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
         } else if (error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
             printf("\tError: Certificate not found in local repository: %s\n",
                 X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf("Certificate not found in local repository: %s",
+                X509_verify_cert_error_string(error));
         } else {
             printf("\tError: %s\n\n", X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf(X509_verify_cert_error_string(error));
         }
     }
     return ok;
@@ -2635,6 +2638,7 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
 
         printf("CMS_verify error\n");
         printf("\nFailed timestamp certificate chain retrieved from the signature:\n");
+        outfmt_misc_sigerr_printf("Failed timestamp certificate chain");
         cms_certs = CMS_get1_certs(timestamp);
         print_certs_chain(cms_certs);
         sk_X509_pop_free(cms_certs, X509_free);
@@ -2844,6 +2848,7 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     if (!verify_pkcs7_data(p7, store)) {
         printf("PKCS7_verify error\n");
         printf("Failed signing certificate chain retrieved from the signature:\n");
+        outfmt_misc_sigerr_printf("Failed signing certificate chain");
         print_certs_chain(p7->d.sign->cert);
         goto out;
     }
@@ -5729,13 +5734,13 @@ err_cleanup:
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
     if (!ret)
         outjson_set_valid(outjson_global_get(), 1);
-    outjson_global_finish_and_print(stdout);
     if (ret)
         ERR_print_errors_fp(stderr);
     if (options.cmd == CMD_HELP)
         ret = 0; /* OK */
     else
         printf(ret ? "Failed\n" : "Succeeded\n");
+    outjson_global_finish_and_print(stdout);
     free_options(&options);
     return ret;
 }
