@@ -60,6 +60,7 @@
 
 #include "osslsigncode.h"
 #include "helpers.h"
+#include "outjson.h"
 
 /*
  * $ echo -n 3006030200013000 | xxd -r -p | openssl asn1parse -i -inform der
@@ -241,13 +242,23 @@ static int X509_attribute_chain_append_object(STACK_OF(X509_ATTRIBUTE) **unauth_
 static STACK_OF(PKCS7) *signature_list_create(PKCS7 *p7);
 static int PKCS7_compare(const PKCS7 *const *a, const PKCS7 *const *b);
 static PKCS7 *pkcs7_get_sigfile(FILE_FORMAT_CTX *ctx);
-static void print_cert(X509 *cert, int i);
+static void print_cert(X509 *cert, int i, cert_type_t t);
 static int x509_store_load_crlfile(X509_STORE *store, char *cafile, char *crlfile);
 static void load_objects_from_store(const char *url, char *pass, EVP_PKEY **pkey, STACK_OF(X509) *certs, STACK_OF(X509_CRL) *crls);
 static BIO *bio_new_file(const char *filename, const char *mode);
 #ifndef OPENSSL_NO_ENGINE
 static void engine_control_set(GLOBAL_OPTIONS *options, const char *arg);
 #endif /* OPENSSL_NO_ENGINE */
+static int g_store_ex_idx = -1;
+static void store_ex_init_once(void)
+{
+    if (g_store_ex_idx >= 0)
+        return;
+
+    g_store_ex_idx = X509_STORE_get_ex_new_index(
+        0, NULL, NULL, NULL, NULL
+    );
+}
 
 
 /*
@@ -776,7 +787,7 @@ static int verify_callback(int ok, X509_STORE_CTX *ctx)
     if (!ok) {
         int error = X509_STORE_CTX_get_error(ctx);
 
-        print_cert(X509_STORE_CTX_get_current_cert(ctx), 0);
+        print_cert(X509_STORE_CTX_get_current_cert(ctx), 0, CERT_CRL);
         if (error == X509_V_ERR_UNABLE_TO_GET_CRL) {
             char *url = clrdp_url_get_x509(X509_STORE_CTX_get_current_cert(ctx));
 
@@ -1762,23 +1773,49 @@ static int x509_store_set_time(X509_STORE *store, time_t time)
 }
 
 /*
+ * Convert ASN1_TIME to a newly-allocated human-readable string.
+ * [in] time: ASN1_TIME
+ * [returns] allocated string; "N/A" on error
+ */
+static char *asn1_time_to_utf8(const ASN1_TIME *time)
+{
+    BIO *bio = NULL;
+    BUF_MEM *bptr = NULL;
+    char *out = NULL;
+
+    if (!time || !ASN1_TIME_check(time))
+        return OPENSSL_strdup("N/A");
+
+    bio = BIO_new(BIO_s_mem());
+    if (!bio)
+        return OPENSSL_strdup("N/A");
+
+    if (!ASN1_TIME_print(bio, time)) {
+        BIO_free(bio);
+        return OPENSSL_strdup("N/A");
+    }
+
+    BIO_get_mem_ptr(bio, &bptr);
+    out = OPENSSL_strndup(bptr->data, bptr->length);
+    BIO_free(bio);
+
+    return out ? out : OPENSSL_strdup("N/A");
+}
+
+/*
  * Check the syntax of the time structure and print the time in human readable format
  * [in] time: time structure
  * [returns] 0 on error or 1 on success
  */
 static int print_asn1_time(const ASN1_TIME *time)
 {
-    BIO *bp;
+    char *s = asn1_time_to_utf8(time);
+    int ok = (s && strcmp(s, "N/A") != 0);
 
-    if ((time == NULL) || (!ASN1_TIME_check(time))) {
-        printf("N/A\n");
-        return 0; /* FAILED */
-    }
-    bp = BIO_new_fp(stdout, BIO_NOCLOSE);
-    ASN1_TIME_print(bp, time);
-    BIO_free(bp);
-    printf("\n");
-    return 1; /* OK */
+    printf("%s\n", s ? s : "N/A");
+    OPENSSL_free(s);
+
+    return ok ? 1 : 0;
 }
 
 /*
@@ -1841,35 +1878,255 @@ static char *x509_name_to_utf8(const X509_NAME *name)
 }
 
 /*
+ * Return the Common Name (CN) from an X509_NAME as a newly-allocated string.
+ * [in] name: X509_NAME to extract CN from
+ * [returns] allocated string; "N/A" if missing/error
+ */
+static char *x509_name_cn_to_utf8(const X509_NAME *name)
+{
+    char cn[256];
+
+    if (!name)
+        return OPENSSL_strdup("N/A");
+
+    if (X509_NAME_get_text_by_NID((X509_NAME *)name, NID_commonName, cn, (int)sizeof(cn)) > 0)
+        return OPENSSL_strdup(cn);
+
+    return OPENSSL_strdup("N/A");
+}
+
+/*
+ * Return hex digest of a certificate as a newly-allocated string (no colons).
+ * Uses X509_digest() over DER-encoded certificate.
+ * [in] cert: certificate
+ * [in] md: digest algorithm (EVP_md5/sha1/sha256/etc)
+ * [returns] allocated hex string; "N/A" on error
+ */
+static char *x509_cert_fingerprint_hex(X509 *cert, const EVP_MD *md)
+{
+    unsigned int n = 0;
+    unsigned char buf[EVP_MAX_MD_SIZE];
+    char *hex = NULL;
+    unsigned int i;
+
+    if (!cert || !md)
+        return OPENSSL_strdup("N/A");
+
+    if (!X509_digest(cert, md, buf, &n) || n == 0)
+        return OPENSSL_strdup("N/A");
+
+    /* 2 chars per byte + NUL */
+    hex = OPENSSL_malloc((size_t)n * 2 + 1);
+    if (!hex)
+        return OPENSSL_strdup("N/A");
+
+    for (i = 0; i < n; i++)
+        sprintf(hex + (i * 2), "%02X", buf[i]);
+    hex[n * 2] = '\0';
+
+    return hex;
+}
+
+/*
+ * Return the certificate signature algorithm as a newly-allocated string.
+ * Uses X509_ALGOR from TBSCertificate signature (X509_get0_tbs_sigalg on 1.1+).
+ * [in] cert: X509 certificate
+ * [returns] allocated string; "N/A" on error
+ */
+static char *x509_cert_sig_alg_to_utf8(X509 *cert)
+{
+    const X509_ALGOR *alg = NULL;
+    const ASN1_OBJECT *obj = NULL;
+    char oid[128];
+    int nid;
+
+    if (!cert)
+        return OPENSSL_strdup("N/A");
+
+    alg = X509_get0_tbs_sigalg(cert);
+    if (!alg)
+        return OPENSSL_strdup("N/A");
+
+    X509_ALGOR_get0(&obj, NULL, NULL, alg);
+    if (!obj)
+        return OPENSSL_strdup("N/A");
+
+    nid = OBJ_obj2nid(obj);
+    if (nid != NID_undef) {
+        const char *ln = OBJ_nid2ln(nid);
+        return OPENSSL_strdup(ln ? ln : "N/A");
+    }
+
+    oid[0] = '\0';
+    OBJ_obj2txt(oid, (int)sizeof(oid), obj, 1);
+    return OPENSSL_strdup(oid[0] ? oid : "N/A");
+}
+
+/*
+ * Return KeyUsage / ExtendedKeyUsage as a newly-allocated string.
+ * [in] cert: X509 certificate
+ * [returns] allocated string; "N/A" on error
+ */
+static char *x509_cert_valid_usage_to_utf8(X509 *cert)
+{
+    EXTENDED_KEY_USAGE *eku = NULL;
+    int xku;
+    int i, n;
+    BIO *bio = NULL;
+    BUF_MEM *bptr = NULL;
+    char *out = NULL;
+
+    if (!cert)
+        return OPENSSL_strdup("N/A");
+
+    xku = X509_get_extended_key_usage(cert);
+
+    if (xku & XKU_ANYEKU)
+        return OPENSSL_strdup("All");
+
+    eku = (EXTENDED_KEY_USAGE *)X509_get_ext_d2i(cert, NID_ext_key_usage, NULL, NULL);
+    if (!eku)
+        return OPENSSL_strdup("N/A");
+
+    n = sk_ASN1_OBJECT_num(eku);
+    if (n <= 0) {
+        EXTENDED_KEY_USAGE_free(eku);
+        return OPENSSL_strdup("None");
+    }
+
+    bio = BIO_new(BIO_s_mem());
+    if (!bio) {
+        EXTENDED_KEY_USAGE_free(eku);
+        return OPENSSL_strdup("N/A");
+    }
+
+    for (i = 0; i < n; i++) {
+        ASN1_OBJECT *o = sk_ASN1_OBJECT_value(eku, i);
+        int nid = o ? OBJ_obj2nid(o) : NID_undef;
+
+        if (i)
+            BIO_puts(bio, ", ");
+
+        if (nid != NID_undef)
+            BIO_puts(bio, OBJ_nid2ln(nid));
+        else
+            BIO_puts(bio, "Unknown");
+    }
+
+    BIO_get_mem_ptr(bio, &bptr);
+    out = OPENSSL_strndup(bptr->data, bptr->length);
+
+    BIO_free(bio);
+    EXTENDED_KEY_USAGE_free(eku);
+
+    return out ? out : OPENSSL_strdup("N/A");
+}
+
+
+/*
  * Print certificate subject name, issuer name, serial number and expiration date
  * [in] cert: X509 certificate
  * [in] i: certificate number in order
  * [returns] none
  */
-static void print_cert(X509 *cert, int i)
+static void print_cert(X509 *cert, int i, cert_type_t t)
 {
-    char *subject, *issuer, *serial;
+    char *subject_cn, *subject, *issuer_cn, *issuer;
+    char *serial, *fp_md5, *fp_sha1, *fp_sha256, *sig_alg;
+    char *valid_usage, *not_before, *not_after;
     BIGNUM *serialbn;
+    outjson_certificate *new_cert;
 
     if (!cert)
         return;
+
+    subject_cn = x509_name_cn_to_utf8(X509_get_subject_name(cert));
     subject = x509_name_to_utf8(X509_get_subject_name(cert));
+    issuer_cn  = x509_name_cn_to_utf8(X509_get_issuer_name(cert));
     issuer = x509_name_to_utf8(X509_get_issuer_name(cert));
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
     serial = BN_bn2hex(serialbn);
+    fp_md5 = x509_cert_fingerprint_hex(cert, EVP_md5());
+    fp_sha1 = x509_cert_fingerprint_hex(cert, EVP_sha1());
+    fp_sha256 = x509_cert_fingerprint_hex(cert, EVP_sha256());
+    sig_alg = x509_cert_sig_alg_to_utf8(cert);
+    valid_usage = x509_cert_valid_usage_to_utf8(cert);
+    not_before = asn1_time_to_utf8(X509_get0_notBefore(cert));
+    not_after = asn1_time_to_utf8(X509_get0_notAfter(cert));
+
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+        if (t == CERT_SIGNER || t == CERT_SIGNER_CHAIN || t == CERT_COUNTERSIGNER) {
+            new_cert = outjson_cert_new(
+                i,
+                subject_cn,
+                subject,
+                issuer_cn,
+                issuer,
+                serial,
+                sig_alg,
+                fp_md5,
+                fp_sha1,
+                fp_sha256,
+                valid_usage,
+                not_before,
+                not_after
+            );
+            if (t == CERT_SIGNER) {
+                outjson_sig_set_original_signer(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            } else if (t == CERT_COUNTERSIGNER){
+                outjson_sig_add_countersigner(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            } else if (t == CERT_SIGNER_CHAIN){
+                outjson_sig_add_signer(
+                    outjson_global_get(),
+                    outjson_sig_curr_get(),
+                    new_cert,
+                    1
+                );
+            }
+        }
+    }
+
     printf("\t------------------\n");
-    printf("\tSigner #%d:\n\t\tSubject: %s\n\t\tIssuer : %s\n\t\tSerial : %s\n\t\tCertificate expiration date:\n",
-            i, subject, issuer, serial);
-    printf("\t\t\tnotBefore : ");
-    print_asn1_time(X509_get0_notBefore(cert));
-    printf("\t\t\tnotAfter : ");
-    print_asn1_time(X509_get0_notAfter(cert));
+    printf("\tSigner #%d:\n", i);
+    printf("\t\tSubject CN: %s\n", subject_cn);
+    printf("\t\tSubject: %s\n", subject);
+    printf("\t\tIssuer CN: %s\n", issuer_cn);
+    printf("\t\tIssuer: %s\n", issuer);
+    printf("\t\tSerial : %s\n", serial);
+    printf("\t\tSignature Algorithm: %s\n", sig_alg);
+    printf("\t\tMD5 Fingerprint: %s\n", fp_md5);
+    printf("\t\tSHA1 Fingerprint: %s\n", fp_sha1);
+    printf("\t\tSHA256 Fingerprint: %s\n", fp_sha256);
+    printf("\t\tValid Usage: %s\n", valid_usage);
+    printf("\n\t\tCertificate expiration date:\n");
+    printf("\t\t\tnotBefore: %s\n", not_before);
+    printf("\t\t\tnotAfter: %s\n", not_after);
     printf("\n");
 
+
+    OPENSSL_free(subject_cn);
+    OPENSSL_free(issuer_cn);
     OPENSSL_free(subject);
     OPENSSL_free(issuer);
     BN_free(serialbn);
     OPENSSL_free(serial);
+    OPENSSL_free(fp_md5);
+    OPENSSL_free(fp_sha1);
+    OPENSSL_free(fp_sha256);
+    OPENSSL_free(sig_alg);
+    OPENSSL_free(valid_usage);
+    OPENSSL_free(not_before);
+    OPENSSL_free(not_after);
 }
 
 /*
@@ -1881,7 +2138,7 @@ static void print_certs_chain(STACK_OF(X509) *certs)
     int i;
 
     for (i=0; i<sk_X509_num(certs); i++) {
-        print_cert(sk_X509_value(certs, i), i);
+        print_cert(sk_X509_value(certs, i), i, CERT_OTHER);
     }
 }
 
@@ -1963,15 +2220,25 @@ static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
     int depth = X509_STORE_CTX_get_error_depth(ctx);
 
     X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
-    print_cert(current_cert, depth);
+    X509_STORE *store = X509_STORE_CTX_get0_store(ctx);
+    cert_type_t t = CERT_OTHER;
+
+    if (store && g_store_ex_idx >= 0) {
+        void *p = X509_STORE_get_ex_data(store, g_store_ex_idx);
+        if (p) t = (cert_type_t)(intptr_t)p;
+    }
+    print_cert(current_cert, depth, t);
     if (!ok) {
         if (trusted_cert(current_cert, error)) {
             return 1;
         } else if (error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
             printf("\tError: Certificate not found in local repository: %s\n",
                 X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf("Certificate not found in local repository: %s",
+                X509_verify_cert_error_string(error));
         } else {
             printf("\tError: %s\n\n", X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf(X509_verify_cert_error_string(error));
         }
     }
     return ok;
@@ -1983,7 +2250,7 @@ static int verify_crl_callback(int ok, X509_STORE_CTX *ctx)
     int depth = X509_STORE_CTX_get_error_depth(ctx);
 
     X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
-    print_cert(current_cert, depth);
+    print_cert(current_cert, depth, CERT_CRL);
     if (!ok) {
         if (trusted_cert(current_cert, error)) {
             return 1;
@@ -2357,6 +2624,8 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
             fprintf(stderr, "Failed to set store time\n");
             goto out;
         }
+        store_ex_init_once();
+        X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_COUNTERSIGNER);
     } else {
         printf("Use the \"-TSA-CAfile\" option to add the Time-Stamp Authority certificates bundle to verify the Timestamp Server.\n");
         goto out;
@@ -2369,6 +2638,7 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
 
         printf("CMS_verify error\n");
         printf("\nFailed timestamp certificate chain retrieved from the signature:\n");
+        outfmt_misc_sigerr_printf("Failed timestamp certificate chain");
         cms_certs = CMS_get1_certs(timestamp);
         print_certs_chain(cms_certs);
         sk_X509_pop_free(cms_certs, X509_free);
@@ -2532,16 +2802,42 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
         fprintf(stderr, "Failed to add store lookup file\n");
         goto out;
     }
+    store_ex_init_once();
+    X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_SIGNER_CHAIN);
     if (time != INVALID_TIME) {
         printf("Signature verification time: ");
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+            ASN1_TIME *at = ASN1_TIME_set(NULL, time);
+            if (at) {
+                char *t = asn1_time_to_utf8(at);
+                if (t) {
+                    outjson_sig_set_signing_time(outjson_sig_curr_get(), t);
+                    OPENSSL_free(t);
+                }
+                ASN1_TIME_free(at);
+            }
+        }
         print_time_t(time);
+        // get signing time from here
         if (!x509_store_set_time(store, time)) {
             fprintf(stderr, "Failed to set signature time\n");
             goto out;
         }
     } else if (ctx->options->time != INVALID_TIME) {
         printf("Signature verification time: ");
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
+            ASN1_TIME *at = ASN1_TIME_set(NULL, time);
+            if (at) {
+                char *t = asn1_time_to_utf8(at);
+                if (t) {
+                    outjson_sig_set_signing_time(outjson_sig_curr_get(), t);
+                    OPENSSL_free(t);
+                }
+                ASN1_TIME_free(at);
+            }
+        }
         print_time_t(ctx->options->time);
+        // get signing time from here
         if (!x509_store_set_time(store, ctx->options->time)) {
             fprintf(stderr, "Failed to set verifying time\n");
             goto out;
@@ -2552,6 +2848,7 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     if (!verify_pkcs7_data(p7, store)) {
         printf("PKCS7_verify error\n");
         printf("Failed signing certificate chain retrieved from the signature:\n");
+        outfmt_misc_sigerr_printf("Failed signing certificate chain");
         print_certs_chain(p7->d.sign->cert);
         goto out;
     }
@@ -2821,6 +3118,9 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
                     desc = OPENSSL_strdup((char *)opus->programName->value.ascii->data);
                 }
                 if (desc) {
+                    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+                        outjson_sig_set_text_description(outjson_sig_curr_get(), desc);
+                    }
                     printf("\tText description: %s\n", desc);
                     OPENSSL_free(desc);
                 }
@@ -2949,6 +3249,9 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
     /* Signature */
     if (verbose) {
         md_nid = OBJ_obj2nid(si->digest_enc_alg->algorithm);
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+            outjson_sig_set_digest_encryption_algorithm(outjson_sig_curr_get(), (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
+        }
         printf("\nDigest encryption algorithm: %s\n",
             (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
         print_hash("Signature", "", ASN1_STRING_get0_data(si->enc_digest), ASN1_STRING_length(si->enc_digest));
@@ -3172,6 +3475,9 @@ static int verify_content_member_digest(FILE_FORMAT_CTX *ctx, ASN1_TYPE *content
         SpcIndirectDataContent_free(idc);
         return 1; /* FAILED */
     } else {
+        if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+            outjson_sig_set_digest_algorithm(outjson_sig_curr_get(), OBJ_nid2sn(mdtype));
+        }
         printf("Message digest algorithm  : %s\n", OBJ_nid2sn(mdtype));
         print_hash("Current message digest    ", "", mdbuf, mdlen);
         print_hash("Calculated message digest ", "\n", cmdbuf, mdlen);
@@ -3260,7 +3566,7 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
     signer = sk_X509_value(signers, 0);
     sk_X509_free(signers);
     printf("Signer's certificate:\n");
-    print_cert(signer, 0);
+    print_cert(signer, 0, CERT_SIGNER);
 
     time = time_t_timestamp_get_attributes(&timestamp, p7, ctx->options->verbose);
     if (ctx->options->leafhash != NULL) {
@@ -3296,6 +3602,9 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
     } else
         printf("\nTimestamp is not available\n\n");
     verok = verify_authenticode(ctx, p7, time, signer);
+    if (outjson_global_is_enabled() && outjson_sig_has_curr()){
+        outjson_sig_set_verified(outjson_sig_curr_get(), verok ? 1 : 0);
+    }
     printf("Signature verification: %s\n\n", verok ? "ok" : "failed");
     if (!verok)
         return 1; /* FAILED */
@@ -3313,6 +3622,8 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
     PKCS7 *p7;
     STACK_OF(PKCS7) *signatures = NULL;
     int detached = options->catalog ? 1 : 0;
+
+    if (outjson_global_is_enabled() && !outjson_global_begin()) { fprintf(stderr,"JSON object failed to init\n"); return 1; }
 
     if (detached) {
         GLOBAL_OPTIONS *cat_options;
@@ -3367,6 +3678,8 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
             continue;
         }
         sig = sk_PKCS7_value(signatures, i);
+        if (outjson_global_is_enabled())
+            outjson_sig_begin(outjson_global_get(), i);
         if (detached) {
             if (!verify_content(ctx, sig)) {
                 ret &= verify_signature(ctx, sig);
@@ -3384,7 +3697,11 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
             fprintf(stderr, "Unsupported method: verify_digests\n");
             return 1; /* FAILED */
         }
+        if (outjson_global_is_enabled() && outjson_sig_has_curr())
+            outjson_sig_finish();
     }
+    if (outjson_global_is_enabled())
+        outjson_set_verified_signature_count(outjson_global_get(), verified);
     printf("Number of verified signatures: %d\n", verified);
     sk_PKCS7_pop_free(signatures, PKCS7_free);
     if (ret)
@@ -4959,6 +5276,9 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->catalog = *(++argv);
+        } else if ((cmd == CMD_VERIFY) && (!strcmp(*argv, "-json"))) {
+            outjson_global_enable();
+            if (!outjson_global_begin()) { fprintf(stderr,"out of memory\n"); return 1; }
         } else if ((cmd == CMD_VERIFY || cmd == CMD_ATTACH) && !strcmp(*argv, "-CAfile")) {
             if (--argc < 1) {
                 usage(argv0, "all");
@@ -5412,12 +5732,15 @@ err_cleanup:
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
     providers_cleanup();
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
+    if (!ret)
+        outjson_set_valid(outjson_global_get(), 1);
     if (ret)
         ERR_print_errors_fp(stderr);
     if (options.cmd == CMD_HELP)
         ret = 0; /* OK */
     else
         printf(ret ? "Failed\n" : "Succeeded\n");
+    outjson_global_finish_and_print(stdout);
     free_options(&options);
     return ret;
 }
