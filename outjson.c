@@ -546,6 +546,27 @@ static cJSON *json_cert(const outjson_certificate *c) {
     return o;
 }
 
+static cJSON *json_cert_by_subject_cn(const outjson_certificate *c)
+{
+    cJSON *wrap = cJSON_CreateObject();
+    if (!wrap) return NULL;
+
+    /* Key: subject_cn (fallback to subject or "UNKNOWN") */
+    const char *key =
+        (c && c->subject_cn && c->subject_cn[0]) ? c->subject_cn :
+        (c && c->subject && c->subject[0])       ? c->subject :
+                                                   "UNKNOWN";
+
+    cJSON *val = json_cert(c); /* your existing function */
+    if (!val) {
+        cJSON_Delete(wrap);
+        return NULL;
+    }
+
+    cJSON_AddItemToObject(wrap, key, val);
+    return wrap;
+}
+
 static cJSON *json_sig(const outjson_signature *sig) {
     cJSON *o = cJSON_CreateObject();
     if (!o) return NULL;
@@ -559,7 +580,7 @@ static cJSON *json_sig(const outjson_signature *sig) {
     cJSON_AddStringToObject(o, "text_description", sig->text_description ? sig->text_description : "");
 
     if (sig && sig->original_signer) {
-        cJSON_AddItemToObject(o, "original_signer", json_cert(sig->original_signer));
+        cJSON_AddItemToObject(o, "original_signer", json_cert_by_subject_cn(sig->original_signer));
     } else {
         cJSON_AddNullToObject(o, "original_signer");
     }
@@ -567,14 +588,14 @@ static cJSON *json_sig(const outjson_signature *sig) {
     cJSON *signers = cJSON_AddArrayToObject(o, "signers");
     if (signers && sig) {
         for (size_t i = 0; i < sig->signers_count; i++) {
-            cJSON_AddItemToArray(signers, json_cert(sig->signers[i]));
+            cJSON_AddItemToArray(signers, json_cert_by_subject_cn(sig->signers[i]));
         }
     }
 
     cJSON *cs = cJSON_AddArrayToObject(o, "countersigners");
     if (cs && sig) {
         for (size_t i = 0; i < sig->countersigners_count; i++) {
-            cJSON_AddItemToArray(cs, json_cert(sig->countersigners[i]));
+            cJSON_AddItemToArray(cs, json_cert_by_subject_cn(sig->countersigners[i]));
         }
     }
 
@@ -631,7 +652,7 @@ int outjson_verify_print(const outjson_verify *vj, FILE *fp) {
         for (size_t i = 0; i < vj->x509_certs_count; i++) {
             /* Don't add root certs to the x509 cert list */
             if (strcmp(vj->x509_certs[i]->issuer_cn, vj->x509_certs[i]->subject_cn))
-                cJSON_AddItemToArray(x509, json_cert(vj->x509_certs[i]));
+                cJSON_AddItemToArray(x509, json_cert_by_subject_cn(vj->x509_certs[i]));
         }
     }
 
