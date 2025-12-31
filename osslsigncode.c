@@ -2229,16 +2229,22 @@ static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
     }
     print_cert(current_cert, depth, t);
     if (!ok) {
+        const char *cert_type_s = "";
+        if (t == CERT_SIGNER_CHAIN || t == CERT_SIGNER) {
+            cert_type_s = "Signing ";
+        } else if (t == CERT_COUNTERSIGNER) {
+            cert_type_s = "Timestamping ";
+        }
         if (trusted_cert(current_cert, error)) {
             return 1;
         } else if (error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
             printf("\tError: Certificate not found in local repository: %s\n",
                 X509_verify_cert_error_string(error));
-            outfmt_misc_sigerr_printf("Certificate not found in local repository: %s",
-                X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf("%scertificate not found in local repository: %s",
+                cert_type_s, X509_verify_cert_error_string(error));
         } else {
             printf("\tError: %s\n\n", X509_verify_cert_error_string(error));
-            outfmt_misc_sigerr_printf(X509_verify_cert_error_string(error));
+            outfmt_misc_sigerr_printf("%scertificate error: %s", cert_type_s, X509_verify_cert_error_string(error));
         }
     }
     return ok;
@@ -2610,6 +2616,10 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
 
     if (!store)
         goto out;
+
+    store_ex_init_once();
+    X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_COUNTERSIGNER);
+
     if (x509_store_load_file(store, ctx->options->tsa_cafile)) {
         /*
          * The TSA signing key MUST be of a sufficient length to allow for a sufficiently
@@ -2624,8 +2634,7 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
             fprintf(stderr, "Failed to set store time\n");
             goto out;
         }
-        store_ex_init_once();
-        X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_COUNTERSIGNER);
+
     } else {
         printf("Use the \"-TSA-CAfile\" option to add the Time-Stamp Authority certificates bundle to verify the Timestamp Server.\n");
         goto out;
@@ -2638,7 +2647,7 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
 
         printf("CMS_verify error\n");
         printf("\nFailed timestamp certificate chain retrieved from the signature:\n");
-        outfmt_misc_sigerr_printf("Failed timestamp certificate chain");
+        outfmt_misc_sigerr_printf("Timestamp certificate chain error: Verification failed");
         cms_certs = CMS_get1_certs(timestamp);
         print_certs_chain(cms_certs);
         sk_X509_pop_free(cms_certs, X509_free);
@@ -2798,12 +2807,14 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     if (!store)
         goto out;
 
+    store_ex_init_once();
+    X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_SIGNER_CHAIN);
+
     if (!x509_store_load_file(store, ctx->options->cafile)) {
         fprintf(stderr, "Failed to add store lookup file\n");
         goto out;
     }
-    store_ex_init_once();
-    X509_STORE_set_ex_data(store, g_store_ex_idx, (void *)(intptr_t)CERT_SIGNER_CHAIN);
+
     if (time != INVALID_TIME) {
         printf("Signature verification time: ");
         if (outjson_global_is_enabled() && outjson_sig_has_curr()) {
@@ -2848,7 +2859,7 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     if (!verify_pkcs7_data(p7, store)) {
         printf("PKCS7_verify error\n");
         printf("Failed signing certificate chain retrieved from the signature:\n");
-        outfmt_misc_sigerr_printf("Failed signing certificate chain");
+        outfmt_misc_sigerr_printf("Signing certificate chain error: Verification failed");
         print_certs_chain(p7->d.sign->cert);
         goto out;
     }

@@ -299,8 +299,17 @@ void outjson_sig_add_openssl_errors(outjson_signature *sig)
         return;
 
     while ((err = ERR_get_error()) != 0) {
+        char *reason;
         ERR_error_string_n(err, buf, sizeof(buf));
-        outjson_sig_add_error(sig, buf);
+
+        reason = strrchr(buf, ':');
+        if (reason && reason > buf && *(reason - 1) == ':') {
+            reason++;
+        } else {
+            reason = buf;
+        }
+
+        outjson_sig_add_error(sig, reason);
     }
 }
 
